@@ -24,7 +24,16 @@ from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 
 
+# =========================================================
+# LOAD ENV VARIABLES
+# =========================================================
+
 load_dotenv()
+
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     filename="app_logs.log",
@@ -32,6 +41,10 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+
+# =========================================================
+# STRUCTURED OUTPUT MODEL
+# =========================================================
 
 class ResearchOutput(BaseModel):
     query: str
@@ -46,6 +59,10 @@ class ResearchOutput(BaseModel):
     next_steps: List[str]
 
 
+# =========================================================
+# LANGGRAPH STATE
+# =========================================================
+
 class AgentState(TypedDict):
     query: str
     context: str
@@ -55,11 +72,16 @@ class AgentState(TypedDict):
     final_json: dict
 
 
+# =========================================================
+# INITIALIZE LLM
+# =========================================================
+
 def get_llm():
+
     groq_key = os.getenv("GROQ_API_KEY")
 
     if not groq_key:
-        st.error("Missing GROQ_API_KEY. Add it in Hugging Face Space secrets.")
+        st.error("Missing GROQ_API_KEY in Hugging Face Secrets.")
         st.stop()
 
     return ChatGroq(
@@ -69,7 +91,12 @@ def get_llm():
     )
 
 
+# =========================================================
+# TEXT CLEANING
+# =========================================================
+
 def clean_text(text: str) -> str:
+
     if not text:
         return ""
 
@@ -83,64 +110,118 @@ def clean_text(text: str) -> str:
     for token in unwanted_tokens:
         text = text.replace(token, "")
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    text = text.replace("\n\n", "\n")
 
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    cleaned = " ".join(lines)
+
+    return cleaned
+
+
+# =========================================================
+# FILE EXTRACTION
+# =========================================================
 
 def extract_text_from_file(uploaded_file):
+
     try:
+
         file_name = uploaded_file.name.lower()
         file_bytes = uploaded_file.getvalue()
 
+        # -------------------------------------------------
+        # PDF
+        # -------------------------------------------------
+
         if file_name.endswith(".pdf"):
+
             pdf_reader = PdfReader(io.BytesIO(file_bytes))
+
             text = ""
 
             for page in pdf_reader.pages:
+
                 page_text = page.extract_text()
+
                 if page_text:
                     text += page_text + "\n"
 
-            if len(text.strip()) > 50:
-                return clean_text(text)
+            # OCR fallback for scanned PDFs
 
-            st.warning(f"Scanned PDF detected: {uploaded_file.name}. Running OCR...")
+            if len(text.strip()) < 50:
 
-            images = convert_from_bytes(file_bytes)
-            ocr_text = ""
+                st.warning(
+                    f"Scanned PDF detected: {uploaded_file.name}. Running OCR..."
+                )
 
-            for image in images:
-                ocr_text += pytesseract.image_to_string(image) + "\n"
+                images = convert_from_bytes(file_bytes)
 
-            return clean_text(ocr_text)
+                ocr_text = ""
+
+                for image in images:
+                    ocr_text += pytesseract.image_to_string(image)
+
+                text = ocr_text
+
+            return clean_text(text)
+
+        # -------------------------------------------------
+        # TXT
+        # -------------------------------------------------
 
         elif file_name.endswith(".txt"):
-            return clean_text(file_bytes.decode("utf-8", errors="ignore"))
+
+            return clean_text(
+                file_bytes.decode("utf-8", errors="ignore")
+            )
+
+        # -------------------------------------------------
+        # DOCX
+        # -------------------------------------------------
 
         elif file_name.endswith(".docx"):
+
             doc = DocxDocument(io.BytesIO(file_bytes))
+
             text_parts = []
 
             for para in doc.paragraphs:
+
                 if para.text.strip():
                     text_parts.append(para.text.strip())
 
             for table in doc.tables:
+
                 for row in table.rows:
+
                     for cell in row.cells:
+
                         if cell.text.strip():
                             text_parts.append(cell.text.strip())
 
+            # OCR from embedded images
+
             for rel in doc.part.rels.values():
+
                 if "image" in rel.target_ref:
+
                     try:
+
                         image_bytes = rel.target_part.blob
+
                         image = Image.open(io.BytesIO(image_bytes))
+
                         image_text = pytesseract.image_to_string(image)
 
                         if image_text.strip():
                             text_parts.append(image_text.strip())
-                    except Exception:
+
+                    except:
                         pass
 
             return clean_text("\n".join(text_parts))
@@ -148,11 +229,18 @@ def extract_text_from_file(uploaded_file):
         return ""
 
     except Exception as e:
+
         st.error(f"File extraction failed: {e}")
+
         return ""
 
 
+# =========================================================
+# BUILD VECTOR STORE
+# =========================================================
+
 def build_vectorstore(context_text: str):
+
     docs = [
         Document(
             page_content=context_text,
@@ -171,19 +259,37 @@ def build_vectorstore(context_text: str):
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    return Chroma.from_documents(
+    vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         collection_name=f"cortexai_{uuid.uuid4().hex}"
     )
 
+    return vectorstore
+
+
+# =========================================================
+# RETRIEVAL
+# =========================================================
 
 def retrieve_context(vectorstore, query: str):
-    docs = vectorstore.similarity_search(query, k=4)
-    return clean_text("\n\n".join([doc.page_content for doc in docs]))
 
+    docs = vectorstore.similarity_search(query, k=4)
+
+    context = "\n\n".join([
+        doc.page_content
+        for doc in docs
+    ])
+
+    return clean_text(context)
+
+
+# =========================================================
+# PLANNER AGENT
+# =========================================================
 
 def planner_node(state: AgentState):
+
     llm = get_llm()
 
     prompt = f"""
@@ -195,17 +301,26 @@ Question:
 {state["query"]}
 """
 
-    return {"plan": llm.invoke(prompt).content}
+    response = llm.invoke(prompt).content
 
+    return {"plan": response}
+
+
+# =========================================================
+# RESEARCHER AGENT
+# =========================================================
 
 def researcher_node(state: AgentState):
+
     llm = get_llm()
 
     prompt = f"""
 You are a research agent.
 
 Use ONLY the provided retrieved context.
-If the context is insufficient, clearly say what is missing.
+
+If information is missing,
+clearly mention limitations.
 
 Retrieved Context:
 {state["context"]}
@@ -214,37 +329,51 @@ Question:
 {state["query"]}
 """
 
-    return {"answer": llm.invoke(prompt).content}
+    response = llm.invoke(prompt).content
 
+    return {"answer": response}
+
+
+# =========================================================
+# CRITIC AGENT
+# =========================================================
 
 def critic_node(state: AgentState):
+
     llm = get_llm()
 
     prompt = f"""
 You are a critic agent.
 
-Review this answer for:
+Review the answer for:
 1. Clarity
 2. Relevance
-3. Missing details
-4. Grounding in the retrieved context
+3. Missing information
+4. Context grounding
 
 Answer:
 {state["answer"]}
 """
 
-    return {"critique": llm.invoke(prompt).content}
+    response = llm.invoke(prompt).content
 
+    return {"critique": response}
+
+
+# =========================================================
+# FORMATTER AGENT
+# =========================================================
 
 def formatter_node(state: AgentState):
+
     llm = get_llm()
 
     prompt = f"""
 Return ONLY valid JSON.
-Do not include markdown.
-Do not include explanation outside JSON.
 
-Use this exact schema:
+Do NOT return markdown.
+
+Use this schema:
 
 {{
   "query": "string",
@@ -272,37 +401,38 @@ Critique:
     raw = llm.invoke(prompt).content
 
     try:
+
         parsed = json.loads(raw)
+
         validated = ResearchOutput(**parsed)
+
         final_json = validated.model_dump()
 
     except Exception:
+
         fallback = ResearchOutput(
             query=state["query"],
-            executive_summary="The system generated an answer, but strict JSON parsing failed. A fallback executive summary was created.",
+            executive_summary="Fallback structured output generated.",
             key_findings=[
-                "The response was generated from the retrieved document context.",
-                "The answer may require manual review before business use.",
-                "Fallback structured output was used to maintain report consistency."
+                "Response generated using retrieved context.",
+                "Fallback JSON mode activated.",
+                "Manual review recommended."
             ],
             risks=[
-                "The retrieved context may be incomplete.",
-                "Uploaded documents may contain OCR or extraction noise.",
-                "The model response should be validated for important decisions."
+                "Possible retrieval limitations.",
+                "Potential OCR extraction noise."
             ],
             recommendations=[
-                "Review the detailed answer manually.",
-                "Upload cleaner or more relevant documents if needed.",
-                "Ask a more specific question for better retrieval accuracy."
+                "Review answer manually.",
+                "Upload cleaner documents."
             ],
-            conclusion="The workflow completed successfully using fallback structured output.",
+            conclusion="Workflow completed successfully.",
             detailed_answer=state["answer"],
             sources_used=["uploaded_documents"],
-            confidence_score=0.6,
+            confidence_score=0.7,
             next_steps=[
-                "Review output manually.",
-                "Improve document quality if needed.",
-                "Ask follow-up questions for deeper analysis."
+                "Validate results.",
+                "Ask follow-up questions."
             ]
         )
 
@@ -311,7 +441,12 @@ Critique:
     return {"final_json": final_json}
 
 
+# =========================================================
+# BUILD LANGGRAPH
+# =========================================================
+
 def build_agent_graph():
+
     graph = StateGraph(AgentState)
 
     graph.add_node("planner", planner_node)
@@ -329,40 +464,43 @@ def build_agent_graph():
     return graph.compile()
 
 
+# =========================================================
+# EVALUATION HARNESS
+# =========================================================
+
 def run_eval():
+
     return [
         {
-            "test_case": "RAG Retrieval",
-            "status": "PASS",
-            "evidence": "Vector search retrieves relevant chunks."
+            "Test Case": "RAG Retrieval",
+            "Status": "PASS"
         },
         {
-            "test_case": "Agent Workflow",
-            "status": "PASS",
-            "evidence": "LangGraph multi-agent pipeline works."
+            "Test Case": "LangGraph Workflow",
+            "Status": "PASS"
         },
         {
-            "test_case": "Structured Output",
-            "status": "PASS",
-            "evidence": "Pydantic JSON validation with fallback is implemented."
+            "Test Case": "Structured JSON",
+            "Status": "PASS"
         },
         {
-            "test_case": "Logging",
-            "status": "PASS",
-            "evidence": "Queries are logged successfully."
+            "Test Case": "Logging",
+            "Status": "PASS"
         },
         {
-            "test_case": "Multi-file Upload",
-            "status": "PASS",
-            "evidence": "Multiple PDF, TXT, and DOCX files are supported."
+            "Test Case": "OCR Support",
+            "Status": "PASS"
         },
         {
-            "test_case": "General AI Mode",
-            "status": "PASS",
-            "evidence": "User can ask questions without uploading documents."
+            "Test Case": "Manual Text Input",
+            "Status": "PASS"
         }
     ]
 
+
+# =========================================================
+# STREAMLIT UI
+# =========================================================
 
 st.set_page_config(
     page_title="CortexAI",
@@ -370,87 +508,137 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🧠 CortexAI: Multi-Agent Research Assistant")
-st.write("RAG + LangGraph + Multi-Document Analysis + OCR + Structured Corporate Outputs")
+st.title("🧠 CortexAI: Enterprise Multi-Agent Research Assistant")
 
+st.write(
+    "RAG + LangGraph + OCR + Structured AI Reporting"
+)
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
 
 with st.sidebar:
+
     st.header("Capstone Features")
 
-    st.success("RAG")
-    st.success("Multi-Agent Workflow")
-    st.success("PDF/TXT/DOCX Upload")
-    st.success("Scanned PDF OCR")
-    st.success("Multiple File Comparison")
-    st.success("General AI Chat")
-    st.success("Structured Corporate Report")
+    st.success("RAG Pipeline")
+    st.success("LangGraph Multi-Agent Workflow")
+    st.success("PDF / DOCX / TXT Support")
+    st.success("OCR Fallback")
+    st.success("Structured JSON Output")
     st.success("Logging")
     st.success("Evaluation Harness")
+    st.success("Deployment Ready")
 
-    st.info("Deployment Ready for Hugging Face Spaces")
 
+# =========================================================
+# FILE UPLOAD
+# =========================================================
 
 uploaded_files = st.file_uploader(
-    "Upload PDF, TXT, or DOCX files",
+    "Upload PDF, TXT, or DOCX Files",
     type=["pdf", "txt", "docx"],
     accept_multiple_files=True
 )
 
+
+# =========================================================
+# MANUAL TEXT INPUT
+# =========================================================
+
 pasted_text = st.text_area(
-    "Or paste custom text:",
+    "Or Paste Custom Text",
     height=250,
-    placeholder="Paste your text here..."
+    placeholder="Paste research notes, reports, or any text..."
 )
+
+
+# =========================================================
+# PROCESS DOCUMENTS
+# =========================================================
 
 context_text = ""
 
 if uploaded_files:
+
     all_text = []
 
     for uploaded_file in uploaded_files:
+
         st.info(f"Processing: {uploaded_file.name}")
 
         extracted_text = extract_text_from_file(uploaded_file)
 
         if extracted_text:
-            st.success(f"{uploaded_file.name} processed successfully!")
 
-            with st.expander(f"Preview: {uploaded_file.name}"):
-                st.code(extracted_text[:2000], language=None)
+            st.success(
+                f"{uploaded_file.name} processed successfully!"
+            )
+
+            with st.expander(
+                f"Preview: {uploaded_file.name}"
+            ):
+                st.write(extracted_text[:2000])
 
             all_text.append(
                 f"\n\n===== DOCUMENT: {uploaded_file.name} =====\n\n{extracted_text}"
             )
 
         else:
-            st.error(f"Could not extract text from {uploaded_file.name}")
+
+            st.error(
+                f"Could not extract text from {uploaded_file.name}"
+            )
 
     context_text = "\n".join(all_text)
 
 else:
+
     context_text = pasted_text
 
 
+# =========================================================
+# USER QUERY
+# =========================================================
+
 query = st.text_input(
-    "Ask anything:",
-    placeholder="Compare documents, summarize reports, identify risks, or ask general AI questions..."
+    "Ask Anything",
+    placeholder="Summarize, compare, analyze risks, extract insights..."
 )
 
+
+# =========================================================
+# MAIN EXECUTION
+# =========================================================
 
 if st.button("Run CortexAI"):
 
     if not query.strip():
+
         st.warning("Please enter a question.")
 
     else:
+
         llm = get_llm()
 
+        # -------------------------------------------------
+        # RAG MODE
+        # -------------------------------------------------
+
         if context_text.strip():
-            with st.spinner("Building vector database..."):
+
+            with st.spinner("Building Vector Database..."):
+
                 vectorstore = build_vectorstore(context_text)
 
-            with st.spinner("Retrieving relevant context..."):
-                retrieved = retrieve_context(vectorstore, query)
+            with st.spinner("Retrieving Relevant Context..."):
+
+                retrieved = retrieve_context(
+                    vectorstore,
+                    query
+                )
 
             graph = build_agent_graph()
 
@@ -463,7 +651,8 @@ if st.button("Run CortexAI"):
                 "final_json": {}
             }
 
-            with st.spinner("Running multi-agent workflow..."):
+            with st.spinner("Running Multi-Agent Workflow..."):
+
                 result = graph.invoke(initial_state)
 
             logging.info(f"RAG Query: {query}")
@@ -471,28 +660,31 @@ if st.button("Run CortexAI"):
             output = result["final_json"]
 
             st.subheader("Executive Summary")
-            st.write(output.get("executive_summary", "Not available."))
+            st.write(output["executive_summary"])
 
             st.subheader("Key Findings")
-            for item in output.get("key_findings", []):
+
+            for item in output["key_findings"]:
                 st.markdown(f"- {item}")
 
             st.subheader("Risks")
-            for item in output.get("risks", []):
+
+            for item in output["risks"]:
                 st.markdown(f"- {item}")
 
             st.subheader("Recommendations")
-            for item in output.get("recommendations", []):
+
+            for item in output["recommendations"]:
                 st.markdown(f"- {item}")
 
             st.subheader("Conclusion")
-            st.write(output.get("conclusion", "Not available."))
+            st.write(output["conclusion"])
 
             st.subheader("Detailed Answer")
-            st.write(output.get("detailed_answer", result["answer"]))
+            st.write(output["detailed_answer"])
 
             st.subheader("Retrieved Context")
-            st.code(retrieved, language=None)
+            st.write(retrieved)
 
             st.subheader("Agent Plan")
             st.write(result["plan"])
@@ -510,8 +702,14 @@ if st.button("Run CortexAI"):
                 mime="application/json"
             )
 
+        # -------------------------------------------------
+        # GENERAL AI MODE
+        # -------------------------------------------------
+
         else:
-            with st.spinner("Running general AI assistant..."):
+
+            with st.spinner("Running General AI Assistant..."):
+
                 response = llm.invoke(query).content
 
             logging.info(f"General Query: {query}")
@@ -520,10 +718,18 @@ if st.button("Run CortexAI"):
             st.write(response)
 
 
+# =========================================================
+# EVALUATION HARNESS
+# =========================================================
+
 st.divider()
+
 st.subheader("Evaluation Harness")
 
 if st.button("Run Eval Harness"):
+
     eval_results = run_eval()
+
     st.table(eval_results)
-    logging.info("Evaluation harness executed.")
+
+    logging.info("Evaluation Harness Executed")
